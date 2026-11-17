@@ -427,6 +427,28 @@ normalizeUrl('https://example.com/admin/users', {
 //=> 'https://example.com/users'
 ```
 
+### parseUrlOrigin(url, options?)
+
+Derives the components an authorization decision (such as an SSRF allowlist) needs, the same way however the URL was written: a full URL and a protocol-relative one naming the same target give the same components. Compare the returned components rather than a serialized URL string.
+
+```js
+import {parseUrlOrigin} from 'normalize-url';
+
+parseUrlOrigin('http://Example.COM:80/a');
+//=> {protocol: 'http:', hostname: 'example.com', port: '80'}
+
+parseUrlOrigin('//Example.COM/a');
+//=> {protocol: 'http:', hostname: 'example.com', port: '80'}
+```
+
+Only the scheme, host, and port are read, since those are what a request targets:
+
+- The `port` is the one that would be dialed: an explicit one, else the scheme's default (`80` for `http:`, `443` for `https:`, and so on), else an empty string for a scheme without one. An explicit default port and a missing one therefore compare equal.
+- The `hostname` is canonicalized under every scheme, so a custom protocol's opaque host gets the same IDNA mapping, lowercasing, and trailing-dot removal as a built-in one's. An IPv6 zone stays on the host as RFC 6874 spells it (`[fe80::1%25eth0]`), since two zones are two targets.
+- An input whose host cannot be told — no authority, an invalid URL, an ambiguous IPv6 zone such as a bare `%` separator — throws a `TypeError` rather than guessing.
+
+The only option is `defaultProtocol` (default `'http'`), the protocol prepended to a protocol-relative URL or a bare host.
+
 ## Related
 
 - [compare-urls](https://github.com/sindresorhus/compare-urls) - Compare URLs by first normalizing them

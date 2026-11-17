@@ -177,6 +177,83 @@ const isReadBackAsItself = (protocol, hostname) => {
 	}
 };
 
+/*
+The port a scheme dials when the URL does not name one. An explicit default port and a missing one are the same target, so an authorization comparison never sees the difference. A scheme not in the table has no port to fill in.
+*/
+const defaultPorts = new Map([
+	['http:', '80'],
+	['https:', '443'],
+	['ws:', '80'],
+	['wss:', '443'],
+	['ftp:', '21'],
+]);
+
+/*
+An IPv6 zone in the authority, written as RFC 6874 spells it: `[fe80::1%25eth0]`. The address is hexadecimal digits, dots, and colons, and the literal must end the host (the end of the authority or a port follows), so a `[` in the userinfo is not matched.
+*/
+// eslint-disable-next-line require-unicode-regexp -- The `v` flag case-folds `a-f` to letters a hexadecimal digit is not written with.
+const ipv6ZonePattern = /\[[\d.:a-f]*%(?<suffix>[^\]]*)\](?=$|:)/i;
+
+/*
+Lifts an IPv6 zone off the authority, since a URL parser rejects one. The zone goes back onto the parsed hostname, so two zones stay two targets. A bare `%` separator or an empty zone is ambiguous and throws rather than being guessed at.
+*/
+const extractIpv6Zone = urlString => {
+	const schemeEnd = urlString.indexOf(':');
+	if (schemeEnd === -1 || !urlString.startsWith('//', schemeEnd + 1)) {
+		return {urlString};
+	}
+
+	const authorityStart = schemeEnd + 3;
+	let authorityEnd = urlString.length;
+	for (const separator of ['/', '?', '#']) {
+		const index = urlString.indexOf(separator, authorityStart);
+		if (index !== -1 && index < authorityEnd) {
+			authorityEnd = index;
+		}
+	}
+
+	const match = ipv6ZonePattern.exec(urlString.slice(authorityStart, authorityEnd));
+	if (!match) {
+		return {urlString};
+	}
+
+	const {suffix} = match.groups;
+	if (!suffix.startsWith('25') || suffix.length === 2) {
+		throw new TypeError(`An IPv6 zone is written as \`%25\` followed by the zone name, got \`%${suffix}\` in \`${urlString}\``);
+	}
+
+	const withoutZone = urlString.slice(0, authorityStart + match.index)
+		+ match[0].slice(0, match[0].indexOf('%')) + ']'
+		+ urlString.slice(authorityStart + match.index + match[0].length);
+
+	return {urlString: withoutZone, zone: suffix.slice(2)};
+};
+
+/*
+The host as the same target reads under any scheme. An opaque host is read again as a domain, so a custom protocol gets the IDNA mapping, lowercasing, and IPv4 spelling a special scheme gets. Trailing dots name the same domain and come off, unless a parser would read the name back as another one, like `159.189.213..`.
+*/
+const canonicalizeHostname = (protocol, hostname) => {
+	if (hostname.startsWith('[')) {
+		return hostname;
+	}
+
+	let canonical = hostname;
+	if (!specialProtocols.has(protocol)) {
+		try {
+			canonical = new URL(`http://${canonical}/`).hostname;
+		} catch {
+			throw new TypeError(`The host \`${hostname}\` cannot be read as a domain`);
+		}
+	}
+
+	const withoutTrailingDots = stripTrailing(canonical, isDot) || '.';
+	if (withoutTrailingDots !== canonical && isReadBackAsItself('http:', withoutTrailingDots)) {
+		canonical = withoutTrailingDots;
+	}
+
+	return canonical;
+};
+
 // Escapes that must survive decoding the pathname: `%25`, since a `%` only starts an escape, and tab, CR, and LF, which a URL parser removes.
 const protectedPathPercentEncodingsPattern = /%(?:09|0a|0d|25)/giv;
 
@@ -725,3 +802,58 @@ export default function normalizeUrl(urlString, options) {
 
 	return urlString;
 }
+
+/*
+The components an authorization decision needs, derived the same way however the URL was written: a full URL and a protocol-relative one naming the same target give the same table. Only the scheme, host, and port are read, since those are what a request targets. The port is the one that would be dialed: an explicit one, else the scheme's default, else an empty string for a scheme without one. The host is lowercased and IDNA-mapped with trailing dots off, and an IPv6 zone is kept, since two zones are two targets. An input whose host cannot be told — no authority, an invalid URL, an ambiguous IPv6 zone — throws rather than guesses.
+*/
+export const parseUrlOrigin = (urlString, options) => {
+	const defaultProtocol = normalizeProtocolOption(options?.defaultProtocol ?? 'http');
+	if (!defaultProtocol) {
+		throw new TypeError(`Expected \`defaultProtocol\` to be a protocol like \`https\`, got \`${String(options?.defaultProtocol)}\``);
+	}
+
+	if (typeof urlString !== 'string') {
+		throw new TypeError(`Expected a string, got \`${typeof urlString}\``);
+	}
+
+	// The same cleanup and protocol prepend as `normalizeUrl`, so the two read an input the same way.
+	let cleaned = stripSurrounding(urlString.replaceAll(/[\t\n\r]/gv, ''), isC0ControlOrWhitespace);
+
+	// A relative path has no host to authorize, and prepending a protocol would read its first segment as one.
+	if (/^\.*\//v.test(cleaned) && !cleaned.startsWith('//')) {
+		throw new TypeError(`Expected a URL with a host, got \`${urlString}\``);
+	}
+
+	cleaned = cleaned.replace(missingProtocolPattern, () => `${defaultProtocol}//`);
+
+	// The zone comes off after the prepend, so a protocol-relative input gets the same reading as a full URL.
+	let zone;
+	({urlString: cleaned, zone} = extractIpv6Zone(cleaned));
+
+	let urlObject;
+	try {
+		urlObject = new URL(cleaned);
+	} catch {
+		throw new TypeError(`Expected a URL with a host, got \`${urlString}\``);
+	}
+
+	if (urlObject.hostname === '') {
+		throw new TypeError(`Expected a URL with a host, got \`${urlString}\``);
+	}
+
+	let hostname = canonicalizeHostname(urlObject.protocol, urlObject.hostname);
+	if (zone !== undefined) {
+		if (!hostname.endsWith(']')) {
+			throw new TypeError(`The IPv6 zone in \`${urlString}\` does not belong to the host`);
+		}
+
+		// Sliced rather than replaced, since a `$` in the zone would be a substitution pattern.
+		hostname = `${hostname.slice(0, -1)}%25${zone}]`;
+	}
+
+	return {
+		protocol: urlObject.protocol,
+		hostname,
+		port: urlObject.port || defaultPorts.get(urlObject.protocol) || '',
+	};
+};

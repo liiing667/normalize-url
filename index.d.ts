@@ -425,3 +425,45 @@ normalizeUrl('//www.sindresorhus.com:80/../baz?b=bar&a=foo');
 ```
 */
 export default function normalizeUrl(url: string, options?: Options): string;
+
+export type UrlOrigin = {
+	/**
+	The scheme, lowercased and with a trailing `:`, as a URL parser writes it.
+	*/
+	readonly protocol: string;
+
+	/**
+	The canonical host: lowercased and IDNA-mapped with trailing dots removed, whatever scheme the URL was written with. An IPv6 host keeps its brackets, and an IPv6 zone stays on the host as RFC 6874 spells it (`[fe80::1%25eth0]`), since two zones are two targets.
+	*/
+	readonly hostname: string;
+
+	/**
+	The port that would be dialed: an explicit one, else the scheme's default (`80` for `http:`, `443` for `https:`, and so on), else an empty string for a scheme without one.
+	*/
+	readonly port: string;
+};
+
+/**
+The only option `parseUrlOrigin` takes is `defaultProtocol`, with the same meaning as in `normalizeUrl`: the protocol prepended to a protocol-relative URL or a bare host, so `//example.com` and `https://example.com` can be read as the same target.
+*/
+export type ParseUrlOriginOptions = Pick<Options, 'defaultProtocol'>;
+
+/**
+Derives the components an authorization decision (such as an SSRF allowlist) needs, the same way however the URL was written: a full URL and a protocol-relative one naming the same target give the same components. Compare the returned components rather than a serialized URL string.
+
+Only the scheme, host, and port are read, since those are what a request targets. The port is the one that would be dialed, so an explicit default port and a missing one compare equal. The host is canonicalized under every scheme, so a custom protocol's opaque host gets the same IDNA mapping, lowercasing, and trailing-dot removal as a built-in one's.
+
+An input whose host cannot be told — no authority, an invalid URL, an ambiguous IPv6 zone — throws a `TypeError` rather than guessing.
+
+@example
+```
+import {parseUrlOrigin} from 'normalize-url';
+
+parseUrlOrigin('http://Example.COM:80/a');
+//=> {protocol: 'http:', hostname: 'example.com', port: '80'}
+
+parseUrlOrigin('//Example.COM/a');
+//=> {protocol: 'http:', hostname: 'example.com', port: '80'}
+```
+*/
+export function parseUrlOrigin(url: string, options?: ParseUrlOriginOptions): UrlOrigin;

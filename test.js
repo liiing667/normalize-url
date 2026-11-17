@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import normalizeUrl from './index.js';
+import normalizeUrl, {parseUrlOrigin} from './index.js';
 
 /*
 What a browser makes of a data URL. `fetch` runs the browser `data:` URL processor, so it is the oracle. A URL it rejects gives `undefined`, as there is nothing to compare.
@@ -3038,6 +3038,9 @@ test('the documented examples match what the library does', () => {
 	*/
 	const examplePattern = /^[\t ]*normalizeUrl\((?<rawArguments>[\s\S]*?)\);?[\t ]*\n[\t ]*(?:\*\/[\t ]*)?\/\/=> '(?<expected>[^\n']*)'/gmv;
 
+	// The same, for a `parseUrlOrigin` example, whose expected value is a component table rather than a string.
+	const originExamplePattern = /^[\t ]*parseUrlOrigin\((?<rawArguments>[\s\S]*?)\);?[\t ]*\n[\t ]*(?:\*\/[\t ]*)?\/\/=> (?<expected>\{[^\n]*\})/gmv;
+
 	for (const [name, text] of [['readme.md', readme], ['index.d.ts', typeDefinitions]]) {
 		let match;
 		let checked = 0;
@@ -3056,6 +3059,20 @@ test('the documented examples match what the library does', () => {
 			// eslint-disable-next-line no-new-func
 			const actual = new Function('normalizeUrl', `"use strict"; return normalizeUrl(${arguments_})`)(normalizeUrl);
 			assert.equal(actual, expected, `${name}: normalizeUrl(${arguments_})`);
+			checked++;
+		}
+
+		while ((match = originExamplePattern.exec(text)) !== null) {
+			const {rawArguments, expected} = match.groups;
+			if (rawArguments.includes('//=>') || rawArguments.includes('```') || rawArguments.length > 400) {
+				continue;
+			}
+
+			const arguments_ = rawArguments.replaceAll(/(?<!\s)\s*\n\s*/gv, ' ').replace(/;$/v, '');
+			// eslint-disable-next-line no-new-func
+			const actual = new Function('parseUrlOrigin', `"use strict"; return parseUrlOrigin(${arguments_})`)(parseUrlOrigin);
+			// eslint-disable-next-line no-new-func
+			assert.deepEqual(actual, new Function(`"use strict"; return (${expected})`)(), `${name}: parseUrlOrigin(${arguments_})`);
 			checked++;
 		}
 
@@ -3563,4 +3580,93 @@ test('the documented limitations hold', () => {
 	assert.equal(normalizeUrl('example.com/a//b', {defaultProtocol: 'ftp'}), 'ftp://example.com/a/b');
 	assert.equal(normalizeUrl('ftp://example.com/a//b'), 'ftp://example.com/a//b');
 	assert.equal(normalizeUrl('ftp://example.com/a//b', {customProtocols: ['ftp']}), 'ftp://example.com/a/b');
+});
+
+test('parseUrlOrigin derives the same components for a full URL and a protocol-relative one', () => {
+	// The component table is compared, not a string, so the two spellings of one target are one entry.
+	for (const [full, relative, options] of [
+		['http://Example.COM:80/a', '//Example.COM/a'],
+		['https://example.com:443/', '//example.com/', {defaultProtocol: 'https'}],
+		['http://[fe80::1%25eth0]/', '//[fe80::1%25eth0]/'],
+		['http://bücher.de./', '//bücher.de./'],
+		['sindre://WWW.Example.COM.:8080/x', '//WWW.Example.COM.:8080/x', {defaultProtocol: 'sindre'}],
+	]) {
+		assert.deepEqual(parseUrlOrigin(relative, options), parseUrlOrigin(full, options), `${full} vs ${relative}`);
+	}
+});
+
+test('parseUrlOrigin resolves the port that would be dialed', () => {
+	// An explicit default port and a missing one are the same target.
+	assert.deepEqual(parseUrlOrigin('http://example.com:80/'), {protocol: 'http:', hostname: 'example.com', port: '80'});
+	assert.deepEqual(parseUrlOrigin('http://example.com/'), {protocol: 'http:', hostname: 'example.com', port: '80'});
+	assert.deepEqual(parseUrlOrigin('https://example.com:443/'), {protocol: 'https:', hostname: 'example.com', port: '443'});
+	assert.deepEqual(parseUrlOrigin('ws://example.com/'), {protocol: 'ws:', hostname: 'example.com', port: '80'});
+	assert.deepEqual(parseUrlOrigin('ftp://example.com:21/'), {protocol: 'ftp:', hostname: 'example.com', port: '21'});
+
+	// A port that is not the scheme's default is kept, and so is one the parser normalizes.
+	assert.deepEqual(parseUrlOrigin('https://example.com:80/'), {protocol: 'https:', hostname: 'example.com', port: '80'});
+	assert.deepEqual(parseUrlOrigin('http://example.com:080/'), {protocol: 'http:', hostname: 'example.com', port: '80'});
+	assert.deepEqual(parseUrlOrigin('http://example.com:8080/'), {protocol: 'http:', hostname: 'example.com', port: '8080'});
+
+	// A scheme without a default port and no explicit one leaves the port empty.
+	assert.deepEqual(parseUrlOrigin('sindre://example.com/'), {protocol: 'sindre:', hostname: 'example.com', port: ''});
+	assert.deepEqual(parseUrlOrigin('file://example.com/etc'), {protocol: 'file:', hostname: 'example.com', port: ''});
+});
+
+test('parseUrlOrigin keeps an IPv6 zone and rejects an ambiguous one', () => {
+	// The zone is part of the target, so it stays on the host, written as RFC 6874 spells it.
+	assert.deepEqual(parseUrlOrigin('http://[fe80::1%25eth0]/'), {protocol: 'http:', hostname: '[fe80::1%25eth0]', port: '80'});
+	assert.deepEqual(parseUrlOrigin('sindre://[fe80::1%25eth0]:8080/'), {protocol: 'sindre:', hostname: '[fe80::1%25eth0]', port: '8080'});
+	assert.deepEqual(parseUrlOrigin('http://[::1]/'), {protocol: 'http:', hostname: '[::1]', port: '80'});
+
+	// A bare `%` separator or an empty zone is ambiguous and fails rather than being guessed at.
+	assert.throws(() => {
+		parseUrlOrigin('http://[fe80::1%eth0]/');
+	}, {name: 'TypeError', message: /IPv6 zone/v});
+	assert.throws(() => {
+		parseUrlOrigin('//[fe80::1%25]/');
+	}, {name: 'TypeError', message: /IPv6 zone/v});
+});
+
+test('parseUrlOrigin reads the host as the same domain under any scheme', () => {
+	// IDNA, lowercasing, and the trailing dot apply to a custom protocol's opaque host too.
+	assert.deepEqual(parseUrlOrigin('http://bücher.de./'), {protocol: 'http:', hostname: 'xn--bcher-kva.de', port: '80'});
+	assert.deepEqual(parseUrlOrigin('sindre://WWW.Example.COM.:8080/x'), {protocol: 'sindre:', hostname: 'www.example.com', port: '8080'});
+	assert.deepEqual(parseUrlOrigin('sindre://bücher.de./'), {protocol: 'sindre:', hostname: 'xn--bcher-kva.de', port: ''});
+
+	// An IPv4 address is spelled one way, whatever scheme or notation hid it.
+	assert.deepEqual(parseUrlOrigin('http://0x7f.1/'), {protocol: 'http:', hostname: '127.0.0.1', port: '80'});
+	assert.deepEqual(parseUrlOrigin('sindre://0x7f.1/'), {protocol: 'sindre:', hostname: '127.0.0.1', port: ''});
+
+	// A name of numbers a parser would read back as another one keeps its dots, the same rule as `normalizeUrl`.
+	assert.deepEqual(parseUrlOrigin('http://159.189.213../'), {protocol: 'http:', hostname: '159.189.213..', port: '80'});
+	assert.deepEqual(parseUrlOrigin('sindre://159.189.213../'), {protocol: 'sindre:', hostname: '159.189.213..', port: ''});
+
+	// The userinfo is not a component of the target.
+	assert.deepEqual(parseUrlOrigin('http://user:pass@example.com/'), {protocol: 'http:', hostname: 'example.com', port: '80'});
+});
+
+test('parseUrlOrigin fails explicitly when there is no host to authorize', () => {
+	for (const url of [
+		'mailto:foo@example.com',
+		'data:text/plain,hello',
+		'file:///etc/passwd',
+		'http://',
+		'/relative/path',
+		'./relative',
+		'sindre:opaque-path',
+		'not a url',
+	]) {
+		assert.throws(() => {
+			parseUrlOrigin(url);
+		}, {name: 'TypeError'}, url);
+	}
+
+	assert.throws(() => {
+		parseUrlOrigin('example.com', {defaultProtocol: 'https://'});
+	}, {name: 'TypeError', message: /defaultProtocol/v});
+
+	assert.throws(() => {
+		parseUrlOrigin(42);
+	}, {name: 'TypeError', message: /string/v});
 });
