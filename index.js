@@ -725,3 +725,122 @@ export default function normalizeUrl(urlString, options) {
 
 	return urlString;
 }
+
+/*
+Builds the fixed spelling of a query the same way `normalizeUrl` writes one, but without sorting or filtering: a parameter a server reads differently, such as a repeated key or an empty value spelled with or without `=`, is kept. The parameters are read in their input order and written back through `URLSearchParams`, so the spelling is canonical yet lossless in the parameters themselves.
+*/
+const getCacheKeySearch = urlObject => {
+	const originalSearch = urlObject.search;
+	let encodedReservedTokenRegex;
+	let searchParameters = [...urlObject.searchParams];
+
+	// Encoded reserved characters are swapped for a temporary token, so the round trip below keeps them encoded instead of reading them as the character they escape.
+	if (encodedReservedCharactersTest.test(originalSearch)) {
+		const encodedReservedTokenPrefix = getTemporaryEncodedReservedTokenPrefix(originalSearch);
+		urlObject.search = originalSearch.replaceAll(encodedReservedCharactersRegex, match => `${encodedReservedTokenPrefix}${match.slice(1).toUpperCase()}`);
+		encodedReservedTokenRegex = new RegExp(`${encodedReservedTokenPrefix}([0-9A-F]{2})`, 'gv');
+		searchParameters = [...urlObject.searchParams];
+	}
+
+	// The parameters are written back through `URLSearchParams`, in their input order: no sort and no filter, so a repeated key keeps both its entries and its position.
+	urlObject.search = new URLSearchParams(searchParameters).toString();
+	// eslint-disable-next-line unicorn/no-unsafe-string-replacement -- The replacement is a function, so a `$` in the matched escape is literal.
+	urlObject.search = decodeURIComponent(urlObject.search.replaceAll(protectedSearchPercentEncodingsPattern, doubleEncodePercentSign));
+
+	if (encodedReservedTokenRegex) {
+		urlObject.search = urlObject.search.replace(encodedReservedTokenRegex, '%$1');
+	}
+
+	// The `preserve` spelling of an empty value is decided from the input, so `?key` and `?key=` stay different.
+	urlObject.search = canonicalizePercentEscapes(normalizeEmptyQueryParameters(urlObject.search, 'preserve', originalSearch));
+};
+
+/**
+A deterministic cache key for an authorization decision, such as which token or cached response belongs to a request. `normalizeUrl` is a display normalization: it strips the userinfo and usually the fragment, sorts and filters the query, and passes custom protocols through, so two different requests can share one normalized string and one spelling of a request can produce several. The key keeps every component that names a different request, and canonicalizes only the spellings that read as the same one.
+
+The rules are fixed on purpose, so the key is judgeable without options:
+- The userinfo is kept, since different credentials are different requests. Its unreserved escapes are decoded and the rest are canonicalized, the same spelling `normalizeUrl` writes with `stripAuthentication: false`.
+- The fragment is kept, including an empty one spelled `#`, since a request carries it. Its escapes are only canonicalized, never decoded, so an encoded delimiter stays content.
+- Every query parameter is kept in its input order: no sorting, no `utm_*` filtering, and no dropping of a repeated key. Empty values keep the `?key` versus `?key=` distinction.
+- The path keeps its trailing slash and its duplicate slashes, and a percent escape that would change the structure (such as `%2F`) stays encoded, so two paths a server can read differently stay different.
+- A URL with an authority is read under any scheme, so a custom protocol gets the same treatment as a built-in one rather than being passed through. A URL without an authority (an opaque path, a relative path, or a `data:` URL) has no request target to key and throws.
+
+The result is the fixed input a cache should hash or compare: feeding it back through `getAuthorizationCacheKey` returns the same string.
+
+@param {string} urlString - The URL to key. It is not modified.
+
+@returns {string} The deterministic cache key for the request the URL names.
+
+@throws {TypeError} When the input is not a string, is not parseable, or names no authority to key.
+*/
+export const getAuthorizationCacheKey = urlString => {
+	if (typeof urlString !== 'string') {
+		throw new TypeError(`Expected a string, got \`${typeof urlString}\``);
+	}
+
+	// A `data:` URL carries a payload, not a request target.
+	if (/^data:/iv.test(urlString)) {
+		throw new TypeError(`Expected a URL with a host, got a \`data:\` URL: \`${urlString}\``);
+	}
+
+	// The same cleanup `normalizeUrl` does up front, so the two read an input the same way.
+	let cleaned = stripSurrounding(urlString.replaceAll(/[\t\n\r]/gv, ''), isC0ControlOrWhitespace);
+
+	// A relative path has no authority; prepending a protocol would read its first segment as a host.
+	if (/^\.*\//v.test(cleaned) && !cleaned.startsWith('//')) {
+		throw new TypeError(`Expected a URL with a host, got \`${urlString}\``);
+	}
+
+	// An explicit scheme without an authority (an opaque URL such as `tel:` or `mailto:`) names no request target. The same detector `normalizeUrl` uses tells a scheme from a `host:port`, so `example.com:8080/a` is still read as a host while `tel:12345` is rejected.
+	const customProtocol = getCustomProtocol(cleaned, new Set());
+	if (customProtocol && !cleaned.slice(0, customProtocol.length + 2).toLowerCase().startsWith(`${customProtocol}//`)) {
+		throw new TypeError(`Expected a URL with a host, got \`${urlString}\``);
+	}
+
+	// A bare host or a protocol-relative URL is read against the default protocol, the same default `normalizeUrl` uses.
+	cleaned = cleaned.replace(missingProtocolPattern, () => 'http://');
+
+	let urlObject;
+	try {
+		urlObject = new URL(cleaned);
+	} catch {
+		throw new TypeError(`Expected a URL with a host, got \`${urlString}\``);
+	}
+
+	// An opaque URL (such as `mailto:` or `sindre:opaque`) and an empty host (such as `file:///`) name no request target.
+	if (urlObject.hostname === '') {
+		throw new TypeError(`Expected a URL with a host, got \`${urlString}\``);
+	}
+
+	// The userinfo is part of the identity. Its escapes are canonicalized the same way `normalizeUrl` does when it keeps them.
+	urlObject.username &&= canonicalizePercentEscapes(decodeUnreservedPercentEscapes(urlObject.username));
+	urlObject.password &&= canonicalizePercentEscapes(decodeUnreservedPercentEscapes(urlObject.password));
+
+	// The pathname is decoded one segment at a time, keeping the escapes that name a different structure, the same way `normalizeUrl` reads it. Trailing slashes and duplicate slashes are deliberately left in place.
+	if (urlObject.pathname) {
+		urlObject.pathname = urlObject.pathname
+			.split('/')
+			.map(segment => {
+				try {
+					// eslint-disable-next-line unicorn/no-unsafe-string-replacement -- The replacement is a function, so a `$` in the matched escape is literal.
+					return decodeURI(segment.replaceAll(protectedPathPercentEncodingsPattern, doubleEncodePercentSign)).replaceAll('\\', '%5C');
+				} catch {
+					return segment;
+				}
+			})
+			.join('/');
+
+		urlObject.pathname = canonicalizePercentEscapes(urlObject.pathname);
+	}
+
+	// The host of a special scheme never has escapes, but an opaque host keeps them as written, so their hexadecimal digits are canonicalized.
+	urlObject.hostname &&= canonicalizePercentEscapes(urlObject.hostname);
+
+	// The query keeps every parameter, in order.
+	getCacheKeySearch(urlObject);
+
+	// The fragment is part of the request. Its escapes are canonicalized but never decoded, the same rule `normalizeUrl` applies to a hash.
+	urlObject.hash &&= canonicalizePercentEscapes(urlObject.hash);
+
+	return urlObject.href;
+};

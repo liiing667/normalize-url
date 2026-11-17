@@ -427,6 +427,34 @@ normalizeUrl('https://example.com/admin/users', {
 //=> 'https://example.com/users'
 ```
 
+### getAuthorizationCacheKey(url)
+
+Builds a deterministic cache key for an authorization decision, such as which token or cached response belongs to a request.
+
+`normalizeUrl` is a display normalization. It strips the [authentication](https://en.wikipedia.org/wiki/Basic_access_authentication) and usually the fragment, sorts and filters the query (for example removing the `utm_*` parameters), and passes a custom protocol through unchanged. Using its output as a cache identity is therefore unsafe: two different requests can share one normalized URL, and one request can be cached under several identities.
+
+`getAuthorizationCacheKey` keeps every component that names a different request and only canonicalizes the spellings that read as the same request. It takes no options, so the rules are fixed and the result is judgeable:
+
+- The userinfo is kept, since different credentials are different requests. Unreserved percent escapes are decoded and every other escape canonicalized, the same spelling `normalizeUrl` writes with `stripAuthentication: false`.
+- The fragment is kept, including an empty one written as `#`. Its escapes are uppercased but never decoded, so an encoded delimiter stays content.
+- Every query parameter is kept in its input order: no sorting, no `utm_*` filtering, and no dropping of a repeated key. `?key` and `?key=` stay different.
+- The path keeps its trailing slash and its duplicate slashes, and an escape that would change the structure (such as `%2F`) stays encoded, so two paths a server can read differently stay different.
+- A URL with an authority is read under any scheme, so a custom protocol gets the same treatment as a built-in one instead of being passed through. The host and scheme are read as a URL parser writes them (lowercased and IDNA-mapped for a special scheme).
+
+The return value is a fixed input a cache can hash or compare: calling `getAuthorizationCacheKey` again on it returns the same string. Two requests that differ in any retained component produce different keys, while spelling-only differences of one request (the scheme case, a default port, `.` and `..` path segments, or equivalent percent escapes) produce the same key.
+
+Throws a `TypeError` when the input is not a string, cannot be parsed, or names no authority (an opaque URL such as `mailto:`, a relative path, or a `data:` URL), since those have no request target to key.
+
+```js
+import {getAuthorizationCacheKey} from 'normalize-url';
+
+getAuthorizationCacheKey('https://user:pass@example.com/a?b=2&a=1#frag');
+//=> 'https://user:pass@example.com/a?b=2&a=1#frag'
+
+getAuthorizationCacheKey('HTTP://EXAMPLE.COM:80/../a');
+//=> 'http://example.com/a'
+```
+
 ## Related
 
 - [compare-urls](https://github.com/sindresorhus/compare-urls) - Compare URLs by first normalizing them

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import normalizeUrl from './index.js';
+import normalizeUrl, {getAuthorizationCacheKey} from './index.js';
 
 /*
 What a browser makes of a data URL. `fetch` runs the browser `data:` URL processor, so it is the oracle. A URL it rejects gives `undefined`, as there is nothing to compare.
@@ -3038,6 +3038,9 @@ test('the documented examples match what the library does', () => {
 	*/
 	const examplePattern = /^[\t ]*normalizeUrl\((?<rawArguments>[\s\S]*?)\);?[\t ]*\n[\t ]*(?:\*\/[\t ]*)?\/\/=> '(?<expected>[^\n']*)'/gmv;
 
+	// The same, for a `getAuthorizationCacheKey` example.
+	const cacheKeyExamplePattern = /^[\t ]*getAuthorizationCacheKey\((?<rawArguments>[\s\S]*?)\);?[\t ]*\n[\t ]*(?:\*\/[\t ]*)?\/\/=> '(?<expected>[^\n']*)'/gmv;
+
 	for (const [name, text] of [['readme.md', readme], ['index.d.ts', typeDefinitions]]) {
 		let match;
 		let checked = 0;
@@ -3056,6 +3059,20 @@ test('the documented examples match what the library does', () => {
 			// eslint-disable-next-line no-new-func
 			const actual = new Function('normalizeUrl', `"use strict"; return normalizeUrl(${arguments_})`)(normalizeUrl);
 			assert.equal(actual, expected, `${name}: normalizeUrl(${arguments_})`);
+			checked++;
+		}
+
+		while ((match = cacheKeyExamplePattern.exec(text)) !== null) {
+			const {rawArguments, expected} = match.groups;
+			// A runaway match, or one that swallowed a block of prose rather than a call.
+			if (rawArguments.includes('//=>') || rawArguments.includes('```') || rawArguments.length > 400) {
+				continue;
+			}
+
+			const arguments_ = rawArguments.replaceAll(/(?<!\s)\s*\n\s*/gv, ' ').replace(/;$/v, '');
+			// eslint-disable-next-line no-new-func
+			const actual = new Function('getAuthorizationCacheKey', `"use strict"; return getAuthorizationCacheKey(${arguments_})`)(getAuthorizationCacheKey);
+			assert.equal(actual, expected, `${name}: getAuthorizationCacheKey(${arguments_})`);
 			checked++;
 		}
 
@@ -3563,4 +3580,175 @@ test('the documented limitations hold', () => {
 	assert.equal(normalizeUrl('example.com/a//b', {defaultProtocol: 'ftp'}), 'ftp://example.com/a/b');
 	assert.equal(normalizeUrl('ftp://example.com/a//b'), 'ftp://example.com/a//b');
 	assert.equal(normalizeUrl('ftp://example.com/a//b', {customProtocols: ['ftp']}), 'ftp://example.com/a/b');
+});
+
+test('getAuthorizationCacheKey keeps the userinfo, so different credentials are different requests', () => {
+	// `normalizeUrl` strips the authentication by default, which would merge these into one cache identity.
+	assert.notEqual(
+		getAuthorizationCacheKey('https://user-a:secret@example.com/resource'),
+		getAuthorizationCacheKey('https://user-b:secret@example.com/resource'),
+	);
+	assert.equal(
+		getAuthorizationCacheKey('https://user-a:secret@example.com/resource'),
+		'https://user-a:secret@example.com/resource',
+	);
+
+	// The userinfo is canonicalized the same way `normalizeUrl` spells it with `stripAuthentication: false`:
+	// an unreserved escape is decoded and a reserved one is only uppercased, so equivalent spellings share a key.
+	assert.equal(
+		getAuthorizationCacheKey('http://u%7Es:p%2fw@example.com/'),
+		'http://u~s:p%2Fw@example.com/',
+	);
+	assert.equal(
+		getAuthorizationCacheKey('http://u~s:p%2Fw@example.com/'),
+		getAuthorizationCacheKey('http://u%7Es:p%2fw@example.com/'),
+	);
+});
+
+test('getAuthorizationCacheKey keeps the fragment, including an empty one', () => {
+	// `normalizeUrl` keeps a fragment but drops a text fragment; a cache key treats the fragment as part of the request.
+	assert.notEqual(
+		getAuthorizationCacheKey('https://example.com/page#section-a'),
+		getAuthorizationCacheKey('https://example.com/page#section-b'),
+	);
+
+	// A bare `#` is an empty but present fragment, so it is not the same request as no fragment.
+	assert.notEqual(
+		getAuthorizationCacheKey('https://example.com/page#'),
+		getAuthorizationCacheKey('https://example.com/page'),
+	);
+	assert.equal(getAuthorizationCacheKey('https://example.com/page#'), 'https://example.com/page#');
+
+	// Fragment escapes are canonicalized but never decoded, so an encoded delimiter stays content and the key is a fixed point.
+	const withEscape = getAuthorizationCacheKey('https://example.com/page#f%2fx%7e');
+	assert.equal(withEscape, 'https://example.com/page#f%2Fx%7E');
+	assert.equal(getAuthorizationCacheKey(withEscape), withEscape);
+});
+
+test('getAuthorizationCacheKey keeps every query parameter in its input order', () => {
+	// A repeated key is kept whole: dropping one entry would cache two different requests as one.
+	assert.notEqual(
+		getAuthorizationCacheKey('https://example.com/?a=1&a=1'),
+		getAuthorizationCacheKey('https://example.com/?a=1'),
+	);
+	assert.equal(getAuthorizationCacheKey('https://example.com/?a=1&a=1'), 'https://example.com/?a=1&a=1');
+
+	// The order is significant, so the key does not sort the way `normalizeUrl` does.
+	assert.notEqual(
+		getAuthorizationCacheKey('https://example.com/?a=1&b=2'),
+		getAuthorizationCacheKey('https://example.com/?b=2&a=1'),
+	);
+
+	// Nothing is filtered out: a `utm_*` parameter is part of the request the cache stores.
+	assert.equal(
+		getAuthorizationCacheKey('https://example.com/?a=1&utm_source=news'),
+		'https://example.com/?a=1&utm_source=news',
+	);
+
+	// The two spellings of an empty value name different parameters for a server that distinguishes them.
+	assert.notEqual(
+		getAuthorizationCacheKey('https://example.com/?key'),
+		getAuthorizationCacheKey('https://example.com/?key='),
+	);
+
+	// The spelling is still canonical: equivalent escapes and a space written as `+` read as one key.
+	assert.equal(
+		getAuthorizationCacheKey('https://example.com/?a%2fb=x&q=one%20two'),
+		getAuthorizationCacheKey('https://example.com/?a%2Fb=x&q=one+two'),
+	);
+});
+
+test('getAuthorizationCacheKey reads a custom protocol instead of passing it through', () => {
+	// `normalizeUrl` returns an unrecognized custom protocol untouched, so two spellings of one request get two cache entries.
+	assert.equal(normalizeUrl('sindre://www.example.com/a'), 'sindre://www.example.com/a');
+
+	// The key normalizes a URL with an authority under any scheme on the same rules.
+	assert.equal(
+		getAuthorizationCacheKey('SINDRE://WWW.Example.COM.:8080/p//q/'),
+		'sindre://WWW.Example.COM.:8080/p//q/',
+	);
+	assert.equal(
+		getAuthorizationCacheKey('sindre://host/a/./b'),
+		getAuthorizationCacheKey('sindre://host/a/b'),
+	);
+
+	// A built-in scheme still gets the host lowercasing and IDNA mapping a URL parser applies.
+	assert.equal(
+		getAuthorizationCacheKey('http://WWW.Example.COM/a'),
+		'http://www.example.com/a',
+	);
+});
+
+test('getAuthorizationCacheKey keeps path spelling a server can read differently', () => {
+	// A trailing slash and a bare path are different requests.
+	assert.notEqual(
+		getAuthorizationCacheKey('https://example.com/resource/'),
+		getAuthorizationCacheKey('https://example.com/resource'),
+	);
+
+	// Duplicate slashes are not collapsed.
+	assert.notEqual(
+		getAuthorizationCacheKey('https://example.com/a//b'),
+		getAuthorizationCacheKey('https://example.com/a/b'),
+	);
+
+	// An encoded slash stays encoded, so it cannot merge with a path segment separator.
+	assert.notEqual(
+		getAuthorizationCacheKey('https://example.com/a%2Fb'),
+		getAuthorizationCacheKey('https://example.com/a/b'),
+	);
+
+	// Dot segments a parser resolves away are spelling-only, so they share a key.
+	assert.equal(
+		getAuthorizationCacheKey('https://example.com/a/./b/../c'),
+		getAuthorizationCacheKey('https://example.com/a/c'),
+	);
+});
+
+test('getAuthorizationCacheKey is a fixed point and folds only equivalent spellings', () => {
+	const inputs = [
+		'http://u%7Es:p%2Fw@example.com/a//b?b=2&a=1&a=2&e&f=#f%2fx',
+		'https://example.com/',
+		'sindre://host:8080/x?z=9',
+		'http://example.com/%7euser?key=&key',
+	];
+
+	for (const input of inputs) {
+		const key = getAuthorizationCacheKey(input);
+		// The cleaned, fixed input is reviewable and stable under another pass.
+		assert.equal(getAuthorizationCacheKey(key), key, input);
+	}
+
+	// Spelling-only differences of one request share a key.
+	for (const [left, right] of [
+		['http://example.com/a', 'HTTP://EXAMPLE.COM/a'],
+		['http://example.com:80/a', 'http://example.com/a'],
+		['http://example.com/%7euser', 'http://example.com/~user'],
+		['//example.com/a', 'http://example.com/a'],
+		['  http://example.com/a  ', 'http://example.com/a'],
+	]) {
+		assert.equal(getAuthorizationCacheKey(left), getAuthorizationCacheKey(right), `${left} vs ${right}`);
+	}
+});
+
+test('getAuthorizationCacheKey fails explicitly when there is no request target to key', () => {
+	for (const url of [
+		'data:text/plain,hello',
+		'mailto:office@example.com',
+		'tel:12345',
+		'sindre:opaque-path',
+		'file:///etc/passwd',
+		'/relative/path',
+		'./relative',
+		'http://',
+		'not a url',
+	]) {
+		assert.throws(() => {
+			getAuthorizationCacheKey(url);
+		}, {name: 'TypeError'}, url);
+	}
+
+	assert.throws(() => {
+		getAuthorizationCacheKey(42);
+	}, {name: 'TypeError', message: /string/v});
 });
