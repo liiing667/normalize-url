@@ -338,15 +338,17 @@ const normalizeEmptyQueryParameters = (search, emptyQueryValue, originalSearch) 
 	return parameters.length === 0 ? '' : `?${parameters.map(x => normalizeParameter(x)).join('&')}`;
 };
 
-const normalizeDataURL = (urlString, {stripHash, stripTextFragment}) => {
+/*
+Parses the media type of a `data:` URL the way a browser reads it, without normalizing anything. The MIME type is lowercased and the parameters are returned as parsed `[name, value]` pairs, where a parameter without an `=` has the value `null`. The base64 marker is reported separately, since it is not a MIME parameter. The fragment and the data never affect the media type, so they are not parsed.
+*/
+const parseDataURLMediaType = urlString => {
 	// Matches every `data:` URL. The comma is optional, since a URL parser accepts a data URL without one, and `[\s\S]` takes line separators, which a parser keeps.
-	const {typeAndData, hash} = /^data:(?<typeAndData>[^#]*)(?:#(?<hash>[\s\S]*))?$/iv.exec(urlString).groups;
+	const {typeAndData} = /^data:(?<typeAndData>[^#]*)(?:#[\s\S]*)?$/iv.exec(urlString).groups;
 
 	/*
 	The data ends at the first comma, even one inside a quoted value, as in a browser. Both parts come from the raw input: a URL parser reads `data://host,` as an authority, and its spelling of the data is not what a browser decodes.
 	*/
 	const separatorIndex = typeAndData.indexOf(',');
-	const data = separatorIndex === -1 ? '' : typeAndData.slice(separatorIndex + 1);
 	const type = separatorIndex === -1 ? typeAndData : typeAndData.slice(0, separatorIndex);
 
 	/*
@@ -383,6 +385,21 @@ const normalizeDataURL = (urlString, {stripHash, stripTextFragment}) => {
 			return [key, value];
 		})
 		.filter(([key]) => key !== '');
+
+	return {mimeType, attributes, isBase64};
+};
+
+const normalizeDataURL = (urlString, {stripHash, stripTextFragment}) => {
+	// Matches every `data:` URL. The comma is optional, since a URL parser accepts a data URL without one, and `[\s\S]` takes line separators, which a parser keeps.
+	const {typeAndData, hash} = /^data:(?<typeAndData>[^#]*)(?:#(?<hash>[\s\S]*))?$/iv.exec(urlString).groups;
+
+	/*
+	The data ends at the first comma, even one inside a quoted value, as in a browser. Both parts come from the raw input: a URL parser reads `data://host,` as an authority, and its spelling of the data is not what a browser decodes.
+	*/
+	const separatorIndex = typeAndData.indexOf(',');
+	const data = separatorIndex === -1 ? '' : typeAndData.slice(separatorIndex + 1);
+
+	const {mimeType, attributes, isBase64} = parseDataURLMediaType(urlString);
 
 	/*
 	The default charset is dropped only when it is redundant:
@@ -443,6 +460,84 @@ const normalizeDataURL = (urlString, {stripHash, stripTextFragment}) => {
 	*/
 	const separator = separatorIndex === -1 && joinedMediaType !== '' ? '' : ',';
 	return `data:${joinedMediaType}${separator}${normalizedData}${hashPart}`;
+};
+
+/*
+The fixed matrix of media types a browser cannot make active. The type alone decides, so parameters, the base64 marker, quoting and percent encoding never raise the level: `text/html;base64` stays `active`, and an unknown type never becomes `inert`.
+*/
+const inertDataURLMediaTypes = new Set([
+	'text/plain',
+	'text/css',
+	'text/csv',
+	'application/json',
+	'application/pdf',
+	'application/octet-stream',
+	'application/x-www-form-urlencoded',
+	'image/apng',
+	'image/avif',
+	'image/bmp',
+	'image/gif',
+	'image/jpeg',
+	'image/png',
+	'image/webp',
+	'image/x-icon',
+	'audio/aac',
+	'audio/flac',
+	'audio/mpeg',
+	'audio/ogg',
+	'audio/wav',
+	'audio/webm',
+	'video/mp4',
+	'video/mpeg',
+	'video/ogg',
+	'video/webm',
+	'font/collection',
+	'font/otf',
+	'font/sfnt',
+	'font/ttf',
+	'font/woff',
+	'font/woff2',
+	'application/font-tdpfr',
+	'application/vnd.ms-fontobject',
+	'application/x-font-datafork',
+	'application/x-font-ttf',
+	'application/x-font-otf',
+]);
+
+/*
+The media types a browser runs as a document, a script or another active context. `text/html` and the XML types carry scripts, SVG is an XML document, and the JavaScript MIME types execute as a script. XML-based types, such as `application/xhtml+xml`, are also caught by the `+xml` suffix below.
+*/
+const activeDataURLMediaTypes = new Set([
+	'text/html',
+	'text/javascript',
+	'text/ecmascript',
+	'application/javascript',
+	'application/ecmascript',
+	'application/x-javascript',
+	'application/x-ecmascript',
+	'text/jscript',
+	'text/livescript',
+	'text/xml',
+	'application/xml',
+	'application/ogg',
+	'multipart/x-mixed-replace',
+]);
+
+/*
+Classifies a `data:` URL by the media type a browser reads it as, so a caller that can only display content knows whether a browser would run it. The empty media type means `text/plain;charset=us-ascii`, which is inert. A media type on the active matrix, or one ending in the `+xml` suffix, is active. Any other spelling, including an invalid one a browser rejects or defaults on, is unknown, since an unknown type cannot be trusted as inert.
+*/
+export const classifyDataUrl = urlString => {
+	if (typeof urlString !== 'string' || !/^data:/iv.test(urlString)) {
+		throw new TypeError(`Expected a \`data:\` URL, got \`${String(urlString)}\``);
+	}
+
+	const {mimeType} = parseDataURLMediaType(urlString);
+
+	if (mimeType === '' || inertDataURLMediaTypes.has(mimeType)) {
+		return 'inert';
+	}
+
+	return (activeDataURLMediaTypes.has(mimeType) || mimeType.endsWith('+xml')) ? 'active' : 'unknown';
 };
 
 export default function normalizeUrl(urlString, options) {

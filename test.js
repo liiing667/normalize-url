@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import normalizeUrl from './index.js';
+import normalizeUrl, {classifyDataUrl} from './index.js';
 
 /*
 What a browser makes of a data URL. `fetch` runs the browser `data:` URL processor, so it is the oracle. A URL it rejects gives `undefined`, as there is nothing to compare.
@@ -1516,6 +1516,202 @@ test('data URL', () => {
 	assert.equal(normalizeUrl('data:,sindresorhus.com?foo=bar&a=a&utm_medium=test', options), 'data:,sindresorhus.com?foo=bar&a=a&utm_medium=test');
 	assert.equal(normalizeUrl('data:,foo#bar', options), 'data:,foo');
 	assert.equal(normalizeUrl('data:,www.sindresorhus.com', options), 'data:,www.sindresorhus.com');
+});
+
+test('classifyDataUrl: the fixed inert media type matrix', () => {
+	const inertMediaTypes = [
+		'text/plain',
+		'text/css',
+		'text/csv',
+		'application/json',
+		'application/pdf',
+		'application/octet-stream',
+		'application/x-www-form-urlencoded',
+		'image/apng',
+		'image/avif',
+		'image/bmp',
+		'image/gif',
+		'image/jpeg',
+		'image/png',
+		'image/webp',
+		'image/x-icon',
+		'audio/aac',
+		'audio/flac',
+		'audio/mpeg',
+		'audio/ogg',
+		'audio/wav',
+		'audio/webm',
+		'video/mp4',
+		'video/mpeg',
+		'video/ogg',
+		'video/webm',
+		'font/collection',
+		'font/otf',
+		'font/sfnt',
+		'font/ttf',
+		'font/woff',
+		'font/woff2',
+		'application/font-tdpfr',
+		'application/vnd.ms-fontobject',
+		'application/x-font-datafork',
+		'application/x-font-ttf',
+		'application/x-font-otf',
+	];
+
+	for (const mediaType of inertMediaTypes) {
+		assert.equal(classifyDataUrl(`data:${mediaType},data`), 'inert', mediaType);
+		assert.equal(classifyDataUrl(`data:${mediaType.toUpperCase()};base64,REFC`), 'inert', `upper-case ${mediaType}`);
+	}
+});
+
+test('classifyDataUrl: the fixed active media type matrix', () => {
+	const activeMediaTypes = [
+		'text/html',
+		'text/javascript',
+		'text/ecmascript',
+		'application/javascript',
+		'application/ecmascript',
+		'application/x-javascript',
+		'application/x-ecmascript',
+		'text/jscript',
+		'text/livescript',
+		'application/ogg',
+		'multipart/x-mixed-replace',
+	];
+
+	for (const mediaType of activeMediaTypes) {
+		assert.equal(classifyDataUrl(`data:${mediaType},data`), 'active', mediaType);
+		assert.equal(classifyDataUrl(`data:${mediaType.toUpperCase()};base64,REFC`), 'active', `upper-case ${mediaType}`);
+	}
+
+	// Every XML-based type is active, including the ones not spelled out in the matrix.
+	for (const mediaType of [
+		'text/xml',
+		'application/xml',
+		'application/xhtml+xml',
+		'image/svg+xml',
+		'application/mathml+xml',
+		'audio/xm+xml',
+		'application/atom+xml',
+		'text/xsl+xml',
+	]) {
+		assert.equal(classifyDataUrl(`data:${mediaType},data`), 'active', mediaType);
+	}
+});
+
+test('classifyDataUrl: unknown and invalid media types never gain trust', () => {
+	for (const urlString of [
+		'data:application/x-custom,data',
+		'data:text/markdown,data',
+		'data:application/wasm,data',
+		'data:text/event-stream,data',
+		'data:multipart/form-data,data',
+		'data:multipart/mixed,data',
+		'data:message/rfc822,data',
+		'data:image/tiff,data',
+		'data:video/quicktime,data',
+		// No slash: a browser rejects the whole data URL.
+		'data:abc',
+		// Percent text is read literally in a media type, so this is not `text/html`.
+		'data:text%2fhtml,data',
+		// An empty subtype or type is not a valid media type.
+		'data:text/,data',
+		'data:/plain,data',
+		'data:foo/bar+baz,data',
+	]) {
+		assert.equal(classifyDataUrl(urlString), 'unknown', urlString);
+	}
+});
+
+test('classifyDataUrl: the empty media type is the inert text/plain default', () => {
+	for (const urlString of [
+		'data:,data',
+		'data:,',
+		'data:',
+		'data:;base64,REFC',
+		'data:;charset=us-ascii,data',
+		'data:;charset=utf-8,data',
+	]) {
+		assert.equal(classifyDataUrl(urlString), 'inert', urlString);
+	}
+});
+
+test('classifyDataUrl: parameters, their order and the base64 marker cannot raise the level', () => {
+	// An active type stays active whatever wraps it.
+	for (const urlString of [
+		'data:text/html;base64,PGI+eDwvYj4=',
+		'data:text/html;charset=utf-8;base64,PGI+',
+		'data:text/html;charset=us-ascii;name="x.html",<b>',
+		'data:text/html;a=1;b=2;c=3,<b>',
+		'data:text/html;b=2;a=1,<b>',
+		'data:text/html;filename="report.html",<b>',
+		'data:text/html;base64;charset=us-ascii,PGI+',
+		'data:text/html; p="x;base64",<b>',
+	]) {
+		assert.equal(classifyDataUrl(urlString), 'active', urlString);
+	}
+
+	// An inert type stays inert, but only because its media type is on the matrix: no parameter promotes it.
+	for (const urlString of [
+		'data:text/plain;base64,PGI+',
+		'data:text/plain;charset=utf-8;base64,PGI+',
+		'data:image/png;charset=binary;base64,REFC',
+		'data:application/octet-stream;name="x.html";base64,REFC',
+	]) {
+		assert.equal(classifyDataUrl(urlString), 'inert', urlString);
+	}
+
+	// A base64-looking parameter without the marker spelling does not change the level either way.
+	assert.equal(classifyDataUrl('data:text/plain;base64=1,data'), 'inert');
+	assert.equal(classifyDataUrl('data:text/html;base64=1,data'), 'active');
+});
+
+test('classifyDataUrl: percent encoding and casing in the media type cannot raise the level', () => {
+	// The media type is not percent-decoded, so an encoded slash or letter names an unknown type.
+	assert.equal(classifyDataUrl('data:%74ext/html,data'), 'unknown');
+	assert.equal(classifyDataUrl('data:text%2fhtml,data'), 'unknown');
+	assert.equal(classifyDataUrl('data:;%62ase64,REFC'), 'inert');
+
+	// Case does not matter for a real media type.
+	assert.equal(classifyDataUrl('data:TEXT/HTML,data'), 'active');
+	assert.equal(classifyDataUrl('data:Image/PNG;Base64,REFC'), 'inert');
+	assert.equal(classifyDataUrl('data:Application/XHTML+XML,data'), 'active');
+});
+
+test('classifyDataUrl: only the media type matters, not the data or the fragment', () => {
+	// Active markup in an inert-typed payload does not make the URL active.
+	assert.equal(classifyDataUrl('data:text/plain,<script>alert(1)</script>'), 'inert');
+	assert.equal(classifyDataUrl('data:;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=='), 'inert');
+	// An active type is active with any payload, even an empty one or no comma.
+	assert.equal(classifyDataUrl('data:text/html,'), 'active');
+	assert.equal(classifyDataUrl('data:text/html'), 'active');
+	assert.equal(classifyDataUrl('data:text/html#section'), 'active');
+});
+
+test('classifyDataUrl: throws on anything that is not a data URL', () => {
+	for (const urlString of [
+		'https://example.com/',
+		'mailto:foo@example.com',
+		'file:///foo',
+		'text/html,data',
+		'',
+	]) {
+		assert.throws(() => classifyDataUrl(urlString), {name: 'TypeError'}, urlString);
+	}
+});
+
+test('classifyDataUrl: leaves data URL string formatting untouched', () => {
+	// The classifier only reads the URL, so normalization keeps its exact behavior.
+	for (const [input, output] of [
+		['data:,foo', 'data:,foo'],
+		['data:TEXT/HTML;charset=UTF-8,<b>', 'data:text/html;charset=utf-8,<b>'],
+		['data:text/plain;base64,Zm9v', 'data:text/plain;base64,Zm9v'],
+		['data:image/png;base64,REFC', 'data:image/png;base64,REFC'],
+		['data:abc', 'data:abc'],
+	]) {
+		assert.equal(normalizeUrl(input), output, input);
+		assert.equal(classifyDataUrl(input), classifyDataUrl(output), input);
+	}
 });
 
 test('prevents homograph attack', () => {
@@ -3034,9 +3230,8 @@ test('the documented examples match what the library does', () => {
 	const typeDefinitions = fs.readFileSync(new URL('index.d.ts', import.meta.url), 'utf8');
 
 	/*
-	`normalizeUrl(<arguments>);` then a `//=> '<expected>'` line. The call must start a line, or the first match starts at the readme signature and swallows the first example.
+	`functionName(<arguments>);` then a `//=> '<expected>'` line. The call must start a line, or the first match starts at the readme signature and swallows the first example.
 	*/
-	const examplePattern = /^[\t ]*normalizeUrl\((?<rawArguments>[\s\S]*?)\);?[\t ]*\n[\t ]*(?:\*\/[\t ]*)?\/\/=> '(?<expected>[^\n']*)'/gmv;
 
 	for (const [name, text] of [['readme.md', readme], ['index.d.ts', typeDefinitions]]) {
 		let match;
@@ -3045,18 +3240,22 @@ test('the documented examples match what the library does', () => {
 		Every `//=>` line is an example, so their count makes a lost example a failure.
 		*/
 		const documented = text.split('\n').filter(line => line.includes('//=>')).length;
-		while ((match = examplePattern.exec(text)) !== null) {
-			const {rawArguments, expected} = match.groups;
-			// A runaway match, or one that swallowed a block of prose rather than a call.
-			if (rawArguments.includes('//=>') || rawArguments.includes('```') || rawArguments.length > 400) {
-				continue;
-			}
+		for (const functionName of ['normalizeUrl', 'classifyDataUrl']) {
+			const functionExamplePattern = new RegExp(String.raw`^[\t ]*${functionName}\((?<rawArguments>[\s\S]*?)\);?[\t ]*\n[\t ]*(?:\*\/[\t ]*)?\/\/=> '(?<expected>[^\n']*)'`, 'gmv');
+			const function_ = functionName === 'normalizeUrl' ? normalizeUrl : classifyDataUrl;
+			while ((match = functionExamplePattern.exec(text)) !== null) {
+				const {rawArguments, expected} = match.groups;
+				// A runaway match, or one that swallowed a block of prose rather than a call.
+				if (rawArguments.includes('//=>') || rawArguments.includes('```') || rawArguments.length > 400) {
+					continue;
+				}
 
-			const arguments_ = rawArguments.replaceAll(/(?<!\s)\s*\n\s*/gv, ' ').replace(/;$/v, '');
-			// eslint-disable-next-line no-new-func
-			const actual = new Function('normalizeUrl', `"use strict"; return normalizeUrl(${arguments_})`)(normalizeUrl);
-			assert.equal(actual, expected, `${name}: normalizeUrl(${arguments_})`);
-			checked++;
+				const arguments_ = rawArguments.replaceAll(/(?<!\s)\s*\n\s*/gv, ' ').replace(/;$/v, '');
+				// eslint-disable-next-line no-new-func
+				const actual = new Function(functionName, `"use strict"; return ${functionName}(${arguments_})`)(function_);
+				assert.equal(actual, expected, `${name}: ${functionName}(${arguments_})`);
+				checked++;
+			}
 		}
 
 		assert.equal(checked, documented, `${name} checked ${checked} of its ${documented} examples`);

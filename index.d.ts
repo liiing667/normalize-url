@@ -424,4 +424,47 @@ normalizeUrl('//www.sindresorhus.com:80/../baz?b=bar&a=foo');
 //=> 'http://sindresorhus.com/baz?a=foo&b=bar'
 ```
 */
+export type DataUrlClassification =
+	/**
+	The media type is one a browser cannot make active. It renders as plain text, an image, audio, video, a font, or is downloaded as data.
+	*/
+	| 'inert'
+	/**
+	The media type runs in an active browser context, such as an HTML or XML document, an SVG image, or JavaScript.
+	*/
+	| 'active'
+	/**
+	The media type is not on the fixed matrix, including an invalid one a browser rejects or defaults on. An unknown type cannot be trusted as inert.
+	*/
+	| 'unknown';
+
+/**
+Classifies a [data URL](https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/Data_URIs) by the media type a browser reads it as.
+
+The classification is based only on the media type. MIME parameters, their order, the `base64` marker, quoting, and percent encoding can never raise the trust level. A media type a browser runs as a document, a script, or another active context is `'active'`; one on the fixed inert matrix is `'inert'`; and any other spelling, including an unknown or invalid type, is `'unknown'`.
+
+The empty media type means `text/plain;charset=us-ascii`, so it is `'inert'`.
+
+The URL is parsed the same way as in {@link normalizeUrl}, but this function does not modify or return it.
+
+@param urlString - The data URL to classify.
+
+@throws {TypeError} If `urlString` is not a data URL.
+
+@example
+```
+import {classifyDataUrl} from 'normalize-url';
+
+classifyDataUrl('data:text/html,<script>alert(1)</script>');
+//=> 'active'
+
+classifyDataUrl('data:image/png;base64,iVBORw0KGgo=');
+//=> 'inert'
+
+classifyDataUrl('data:application/x-custom,data');
+//=> 'unknown'
+```
+*/
+export function classifyDataUrl(urlString: string): DataUrlClassification;
+
 export default function normalizeUrl(url: string, options?: Options): string;

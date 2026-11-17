@@ -427,6 +427,31 @@ normalizeUrl('https://example.com/admin/users', {
 //=> 'https://example.com/users'
 ```
 
+### classifyDataUrl(url)
+
+Classifies a [data URL](https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/Data_URIs) by the media type a browser reads it as, so a caller that can only display content knows whether a browser would run it. Returns one of:
+
+- `'inert'` - The media type is on a fixed matrix of types a browser cannot make active: plain text, images, audio, video, fonts, JSON, PDF, and download data. The empty media type, which means `text/plain;charset=us-ascii`, is inert too.
+- `'active'` - The media type runs in an active browser context: HTML, XML (including any `+xml` type such as SVG), JavaScript, OGG, or `multipart/x-mixed-replace`.
+- `'unknown'` - The media type is not on either matrix, including an invalid one a browser rejects or defaults on. An unknown type can never be trusted as inert.
+
+Only the media type decides. MIME parameters, their order, the `base64` marker, quoting, and percent encoding can never raise the trust level: `text/html;base64` stays `active`, `text/plain;base64` stays `inert`, and `data:text%2fhtml,...` is `unknown` because the media type is read literally. This function does not modify the URL or its formatting.
+
+@throws `TypeError` when the input is not a data URL.
+
+```js
+import {classifyDataUrl} from 'normalize-url';
+
+classifyDataUrl('data:text/html,<script>alert(1)</script>');
+//=> 'active'
+
+classifyDataUrl('data:image/png;base64,iVBORw0KGgo=');
+//=> 'inert'
+
+classifyDataUrl('data:application/x-custom,data');
+//=> 'unknown'
+```
+
 ## Related
 
 - [compare-urls](https://github.com/sindresorhus/compare-urls) - Compare URLs by first normalizing them
